@@ -1212,6 +1212,438 @@ __global__ void ellpack_row_based(double* entries, int* col_idx, int* slice_ptr,
   }
 }
 
+//Assemble Laplace matrix
+__global__ void assemble_Laplace(double* diag, double* entries, int* slice_ptr, int* slice_ptr_face, int* col_idx, int* face_map, double* b_dev, double* k_f, double* delta_f,
+  double* f_x, double* boundary_vals, int n_rows, int n_faces){
+  extern __shared__ double local_grads[];
+
+  int read_start = slice_ptr_face[blockIdx.x];
+  int read_end = slice_ptr_face[blockIdx.x + 1];
+  int num_faces = (read_end - read_start)/blockDim.x;
+  int read_idx = read_start + threadIdx.x;
+
+  int write_start = slice_ptr[blockIdx.x];
+  int write_end = slice_ptr[blockIdx.x + 1];
+  int row = blockIdx.x*blockDim.x + threadIdx.x;
+  int write_idx = write_start + threadIdx.x;
+
+  bool in_domain = (row < n_rows);
+
+  double diag_coef = 0;
+  double b = 0;
+  double this_grad[3];
+
+  for(int j=0; j<3; j++){
+    this_grad[j] = grad[j*n_rows + row];
+    local_grads[j*blockDim.x] = this_grad[j];
+  }
+
+  __syncthreads();
+
+  //Loop over faces of cell
+  for(int i = 0; i < num_faces; i++){
+    //Get face id
+    int face_id = face_map[read_idx];
+
+    if(face_id != 0){
+      bool is_owner = (face_id > 0);
+      face_id = abs(face_id) - 1;
+      double ratio = face_ratio[face_id];
+      int boundary = face_boundary[face_id];
+
+      //Face is internal
+      if(boundary == 0){
+        //Set off-diagonal coefficient and add to diagonal
+        entries[write_idx] += -ratio;
+        diag_coef += ratio;
+
+        //Get k_f
+        double kf[3];
+        for(int j=0; j<3; j++){
+          kf[j] = k_f[j*n_faces + face_id];
+        }
+
+        //Get magnitude
+        double k_mag = kf[0]*kf[0] + kf[1]*kf[1] + kf[2]*kf[2];
+
+        //Are inter-cell vector and face normal parallel?
+        //if not we need non-orthogonal correction
+        if(k_mag > 10e-10){
+          double fx = f_x[face_id];
+          fx = (is_owner) ? fx : 1-f_x;
+          double dot = 0;
+          int nbr_id = col_idx[write_idx];
+          for(int j=0; j<3; j++){
+            dot += kf[j]*fx*this_grad[j];
+            if(nbr_id < 0){
+              dot += kf[j]*(1-fx)*local_grads[j*blockDim.x -(nbr_id + 1)];
+            }
+            else{
+              dot += kf[j]*(1-fx)*grad[j*n_rows + nbr_id - 1];
+            }
+          }
+        }
+        b += dot;
+        write_idx += blockDim.x;
+      }
+
+      //Face is dirichlet boundary
+      else if (boundary > 0){
+        double b_val = boundary_vals[abs(boundary) - 1];
+        diag_coef += ratio;
+        b += ratio*b_val;
+      }
+
+      //Neumann Boundary
+      else{
+        double b_val = boundary_vals[abs(boundary) - 1];
+        double fa = face_area[face_id];
+        b += fa*b_val;
+      }
+      read_idx += blockDim.x;
+      __syncwarp();
+    }
+  }
+
+  //Set diagonal coefficient and source term
+  if(in_domain){
+    diag[row] += diag_coef;
+    b_dev[row] += b;
+  }
+}
+
+__global__ void calc_grad(double* x_dev, int* slice_ptr, int* face_map, int* col_idx, double* face_dN,
+  double* G_dev, int* boundaries, double* boundary_vals, double* cell_grads, int n_faces, int n_rows){
+  extern __shared__ double x_shared[];
+
+  int read_start = slice_ptr_face[blockIdx.x];
+  int read_end = slice_ptr_face[blockIdx.x + 1];
+  int num_faces = (read_end - read_start)/blockDim.x;
+  int read_idx = read_start + threadIdx.x;
+
+  int write_start = slice_ptr[blockIdx.x];
+  int write_end = slice_ptr[blockIdx.x + 1];
+  int row = blockIdx.x*blockDim.x + threadIdx.x;
+  int write_idx = write_start + threadIdx.x;
+  bool in_domain = (row < n_rows);
+
+  double cell_sum[3];
+  double x;
+
+  double G[3][3];
+
+  for(int j = 0; j < 3; j++){
+    cell_sum[j] = 0;
+    G[j][0] = 0;
+    G[j][1] = 0;
+    G[j][2] = 0;
+  }
+
+  if(in_domain){
+    x = x_dev[row];
+    x_shared[threadIdx.x] = x;
+  }
+
+  //Loop over faces of cell
+  for(int i = 0; i < num_faces; i++){
+    //Get face id
+    int face_id = face_map[read_idx];
+
+    if(face_id != 0){
+      face_id = abs(face_id) - 1;
+      int boundary = face_boundary[face_id];
+      double nbr_val;
+
+      double squared_dist = 0;
+      double d_N[3];
+      for (int j = 0; j < 3; j++){
+        d_N[j] = face_dN[face_id];
+        squared_dist += d_N[j]*d_N[j];
+      }
+
+      //Face is not on boundary
+      if(boundary == 0){
+        int nbr_id = col_idx[write_idx];
+        if(nbr_id < 0){
+          nbr_val = x_shared[-(nbr_val+1)];
+        }
+
+        else if(nbr_id > 1){
+          nbr_val = x_dev[nbr_val-1];
+        }
+        write_idx += blockDim.x;
+      }
+
+      //Face is on boundary which is dirichlet
+      else if (boundary > 0){
+        nbr_val = boundary_vals[abs(boundary) - 1];
+      }
+
+      //Face is on boundary which is Neumann
+      else{
+        nbr_val = x + sqrt(squared_dist)*boundary_vals[abs(boundary) - 1];
+      }
+
+      double w_squared = 1/squared_dist;
+      //Add to cell sum and to G matrix
+      for(int j = 0; j < 3; j++){
+        cell_sum[j] += w_squared*d_N[j]*(nbr_val - x);
+        G[j][0] += w_squared*d_N[0]*d_N[j];
+        G[j][1] += w_squared*d_N[1]*d_N[j];
+        G[j][2] += w_squared*d_N[2]*d_N[j];
+      }
+
+      read_idx += blockDim.x;
+      __syncwarp();
+    }
+  }
+
+  //Solve 3x3 system of equations for gradient
+  //using conjugate gradients
+  double grad[3];
+  if(in_domain){
+    double res[3];
+    double res_sq = 0;
+
+    for(int j = 0; j < 3; j ++){
+      grad[j] = 0;
+      res[j] = cell_sum[j];
+      res_sq += cell_sum[j]*cell_sum[j];
+    }
+
+    //Only need 3 iterations
+    while(fabs(res_sq) > 10e-12){
+      double Gd[3];
+      double dGd = 0;
+
+      //Find Gd and dGd
+      for(int k = 0; k < 3; k++){
+        Gd[k] = G[k][0]*cell_sum[0]
+        Gd[k] += G[k][1]*cell_sum[1]
+        Gd[k] += G[k][2]*cell_sum[2]
+        dGd += cell_sum[k]*Gd[k];
+      }
+
+      double new_res_sq = 0;
+
+      //Update residual and solution
+      for(int k=0; k<3; k++){
+        grad[k] += (res_sq/dGd)*cell_sum[k];
+        res[k] -= (res_sq/dGd)*Gd[k];
+        new_res_sq += res[k]*res[k];
+      }
+
+      //Update search direction
+      for(int k=0; k<3; k++){
+        cell_sum[k] = res[k] + (new_res_sq/res_sq)*cell_sum[k];
+      }
+
+      //Set new residual norm squared
+      res_sq = new_res_sq;
+    }
+  }
+
+  __syncthreads();
+
+  if(in_domain){
+    for(int j = 0; j < 3; j++){
+      cell_grad[j*n_rows + row] = grad[j];
+    }
+  }
+}
+
+__global__ void assemble_Convection(double* x_dev, int* slice_ptr, int* face_map, int* col_idx, double* face_dist,
+  double* f_x, int* boundaries, double* boundary_vals, double* face_flux, int n_faces, int n_rows, bool upwind){
+  int read_start = slice_ptr_face[blockIdx.x];
+  int read_end = slice_ptr_face[blockIdx.x + 1];
+  int num_faces = (read_end - read_start)/blockDim.x;
+  int read_idx = read_start + threadIdx.x;
+
+  int write_start = slice_ptr[blockIdx.x];
+  int write_end = slice_ptr[blockIdx.x + 1];
+  int row = blockIdx.x*blockDim.x + threadIdx.x;
+  int write_idx = write_start + threadIdx.x;
+
+  bool in_domain = (row < n_rows);
+
+  double diag_coef = 0;
+  double b = 0;
+
+  __syncthreads();
+
+  //Loop over faces of cell
+  for(int i = 0; i < num_faces; i++){
+    //Get face id
+    int face_id = face_map[read_idx];
+
+    if(face_id != 0){
+      bool is_owner = (face_id > 0);
+      face_id = abs(face_id) - 1;
+      double flux = face_flux[face_id];
+      int boundary = face_boundary[face_id];
+      double fx = f_x[face_id];
+
+      //Face is internal
+      if(boundary == 0){
+        if(upwind){
+          if(!(is_owner ^ flux > 0)){
+            diag_coef += flux;
+          }
+
+          else if (is_owner ^ flux <= 0){
+            entries[write_idx] += flux;
+          }
+        }
+
+        else{
+          if(is_owner){
+            diag_coef += fx*flux;
+            entries[write_idx] += (1-fx)*flux;
+          }
+
+          else{
+            diag_coef += -(1-fx)*flux;
+            entries[write_idx] += -fx*flux;
+          }
+        }
+        write_idx += blockDim.x;
+      }
+
+      //Face is dirichlet boundary
+      else if (boundary > 0){
+        double b_val = boundary_vals[abs(boundary) - 1];
+        b += flux*b_val;
+      }
+
+      //Neumann Boundary
+      else{
+        double b_val = boundary_vals[abs(boundary) - 1];
+        diag_coef += flux
+        double dist = face_dist[face_id];
+        b += flux*b_val*dist;
+      }
+      read_idx += blockDim.x;
+      __syncwarp();
+    }
+  }
+
+  //Set diagonal coefficient and source term
+  if(in_domain){
+    diag[row] += diag_coef;
+    b_dev[row] += b;
+  }
+}
+
+__global__ void assemble_timeDeriv(double* x_dev, double* b_dev, int* slice_ptr, int* col_idx, double* cell_vol, int n_rows, double dt){
+  int read_start = slice_ptr[blockIdx.x];
+  int read_end = slice_ptr[blockIdx.x + 1];
+  int row = blockIdx.x*blockDim.x + threadIdx.x;
+  int read_idx = write_start + threadIdx.x;
+  bool in_domain = (row < n_rows);
+
+  double vol = cell_vol[row];
+  double diag_coef = vol/dt;
+  double old_val = x_dev[row];
+
+  b = old_val*(vol/dt);
+
+  __syncthreads();
+  if(in_domain){
+    diag[row] += diag_coef;
+    b_dev[row] += b;
+  }
+}
+
+__global__ void calc_face_Flux(double* vx_dev, double* vy_dev, double* vz_dev, double* b_vals_vx, double* b_vals_vy,
+  double* b_vals_vz, double* f_x, double* s_f, int n_rows, int num_faces){
+  extern __shared__ double velocity_shared[];
+
+  int read_start = slice_ptr_face[blockIdx.x];
+  int read_end = slice_ptr_face[blockIdx.x + 1];
+  int num_faces = (read_end - read_start)/blockDim.x;
+  int row = blockIdx.x*blockDim.x + threadIdx.x;
+  int read_idx = read_start + threadIdx.x;
+  int in_domain = (row < n_rows);
+
+  double v[3];
+  if(in_domain){
+    v[0] = vx_dev[row];
+    v[1] = vy_dev[row];
+    v[2] = vz_dev[row];
+    for(int j = 0; j < 3; j++){
+      velocity_shared[j*blockDim.x + threadIdx.x] = v[j];
+    }
+  }
+
+  //Loop over faces of cell
+  for(int i = 0; i < num_faces; i++){
+    //Get face id
+    int face_id = face_map[read_idx];
+    bool is_owner = (face_id > 0);
+
+    if(is_owner){
+      face_id = abs(face_id) - 1;
+      double sf[3];
+      for(int j = 0; j < 3; j++){
+        sf[j] = s_f[j*num_faces + face_id]
+      }
+      int boundary = face_boundary[face_id];
+      double fx = f_x[face_id];
+      double flux;
+
+      if(boundary == 0){
+        int nbr_id = col_idx[write_idx];
+
+        if(nbr_id < 0){
+          flux = (v[0]*fx + (1-fx)*velocity_shared[-(nbr_id + 1)])*sf[0];
+          flux += (v[1]*fx + (1-fx)*velocity_shared[blockDim.x - (nbr_id + 1)])*sf[1];
+          flux += (v[2]*fx + (1-fx)*velocity_shared[2*blockDim.x - (nbr_id + 1)])sf[2];
+        }
+
+        else{
+          flux = (v[0]*fx + (1-fx)*vx_dev[nbr_id - 1])*sf[0];
+          flux += (v[1]*fx + (1-fx)*vy_dev[nbr_id - 1])*sf[1];
+          flux += (v[2]*fx + (1-fx)*vz_dev[nbr_id - 1])*sf[2];
+        }
+        write_idx += blockDim.x;
+      }
+
+      //Face is dirichlet boundary
+      else if (boundary > 0){
+        b_val = boundary_vals[abs(boundary) - 1];
+        flux = sqrt(sf[0]*sf[0] + sf[1]*sf[1] + sf[2]*sf[2])*b_val;
+      }
+
+      //Neumann Boundary
+      else{
+        double b_val_x = b_vals_vx[abs(boundary) - 1];
+        double dist = face_dist[face_id];
+        flux = (v[0] + dist*b_vals_vx[abs(boundary) - 1])*sf[0];
+        flux += (v[1] + dist*b_vals_vy[abs(boundary) - 1])*sf[1];
+        flux += (v[2] + dist*b_vals_vz[abs(boundary) - 1])*sf[2];
+      }
+
+      face_flux[face_id] = flux;
+
+      read_idx += blockDim.x;
+      __syncwarp();
+    }
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
